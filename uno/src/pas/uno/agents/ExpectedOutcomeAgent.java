@@ -9,6 +9,7 @@ import edu.bu.pas.uno.Hand;
 import edu.bu.pas.uno.Hand.HandView;
 import edu.bu.pas.uno.agents.Agent;
 import edu.bu.pas.uno.agents.MCTSAgent;
+import edu.bu.pas.uno.agents.RandomAgent;
 import edu.bu.pas.uno.enums.Color;
 import edu.bu.pas.uno.enums.Value;
 import edu.bu.pas.uno.moves.Move;
@@ -31,14 +32,15 @@ public class ExpectedOutcomeAgent
 {
 
     // how deep before we stop expanding and just rollout
-    private static final int MAX_DEPTH = 10;
+    private static final int MAX_DEPTH = 3;
 
-    // max steps per rollout to avoid infinite games
-    private static final int MAX_ROLLOUT_STEPS = 500;
+    // time limit per search call in ms — leaves buffer for the game engine timeout
+    private static final long TIME_LIMIT_MS = 500;
+
+    private long searchStartTime;
 
     /**
-     * minimal agent stub — just holds a playerIdx so Move.createMove gets the right id.
-     * logical idx is set separately before each use.
+     * minimal agent stub — holds the correct playerIdx for Move.createMove.
      */
     private static class DummyAgent extends Agent
     {
@@ -55,18 +57,32 @@ public class ExpectedOutcomeAgent
     }
 
     /**
-     * builds a dummy agent array with the correct playerIdx for each logical slot,
-     * looked up from the game's player order.
+     * builds a dummy agent array indexed by logical player.
+     * dummy agents have the correct playerIdx for creating moves.
      */
     private DummyAgent[] buildDummyAgents(final GameView game)
     {
         int n = game.getNumPlayers();
         DummyAgent[] agents = new DummyAgent[n];
-        for (int logicalIdx = 0; logicalIdx < n; logicalIdx++)
+        for (int i = 0; i < n; i++)
         {
-            int playerIdx = game.getPlayerOrder().getAgentIdx(logicalIdx);
-            agents[logicalIdx] = new DummyAgent(playerIdx);
-            agents[logicalIdx].setLogicalPlayerIdx(logicalIdx);
+            int playerIdx = game.getPlayerOrder().getAgentIdx(i);
+            agents[i] = new DummyAgent(playerIdx);
+            agents[i].setLogicalPlayerIdx(i);
+        }
+        return agents;
+    }
+
+    // random agents used as rollout proxies — they pick legal moves via game.getMove()
+    private RandomAgent[] buildRandomAgents(final GameView game)
+    {
+        int n = game.getNumPlayers();
+        RandomAgent[] agents = new RandomAgent[n];
+        for (int i = 0; i < n; i++)
+        {
+            int playerIdx = game.getPlayerOrder().getAgentIdx(i);
+            agents[i] = new RandomAgent(playerIdx, 0L);
+            agents[i].setLogicalPlayerIdx(i);
         }
         return agents;
     }
@@ -74,40 +90,46 @@ public class ExpectedOutcomeAgent
     public static class MCTSNode
         extends Node
     {
+        private final DummyAgent[] agents;
+
         public MCTSNode(final GameView game,
                         final int logicalPlayerIdx,
-                        final Node parent)
+                        final Node parent,
+                        final DummyAgent[] agents)
         {
             super(game, logicalPlayerIdx, parent);
+            this.agents = agents;
         }
 
-        /**
-         * applies the move to a copy of the current state and returns the resulting child node.
-         * null move = player decided to keep the drawn card.
-         */
         @Override
         public Node getChild(final Move move)
         {
-            // copy current state
-            Game childGame = new Game(this.getGameView());
+            Game childGame = new Game(this.getGameView(), this.agents);
 
-            // null here just advances the turn without playing anything
-            try
+            if (this.getNodeState() == NodeState.NO_LEGAL_MOVES_UNRESOLVED_CARDS_PRESENT)
             {
-                childGame.resolveMove(move);
+                // draw the full unresolved stack before advancing the turn
+                int currentLogical = this.getGameView().getPlayerOrder().getCurrentLogicalPlayerIdx();
+                Hand currentHand   = childGame.getHand(currentLogical);
+                int total          = childGame.getUnresolvedCards().total();
+                childGame.drawTotal(currentHand, total);
+                childGame.getUnresolvedCards().clear();
             }
-            catch (NullPointerException e)
+            else if (this.getNodeState() == NodeState.NO_LEGAL_MOVES_MAY_PLAY_DRAWN_CARD)
             {
-                // null rng in copied game — just return a node with current state
+                // draw one card — it lands at the end of the hand
+                int currentLogical = this.getGameView().getPlayerOrder().getCurrentLogicalPlayerIdx();
+                Hand currentHand   = childGame.getHand(currentLogical);
+                childGame.drawCard(currentHand);
+                // move is either null (keep) or a Move to play the drawn card
             }
 
-            // always omniscient in fully observable mode
-            GameView childView = childGame.getOmniscientView();
+            childGame.resolveMove(move);
 
-            // whoever's turn it is now
+            GameView childView        = childGame.getOmniscientView();
             int childLogicalPlayerIdx = childView.getPlayerOrder().getCurrentLogicalPlayerIdx();
 
-            return new MCTSNode(childView, childLogicalPlayerIdx, this);
+            return new MCTSNode(childView, childLogicalPlayerIdx, this, this.agents);
         }
     }
 
@@ -117,103 +139,23 @@ public class ExpectedOutcomeAgent
         super(playerIdx, maxThinkingTimeInMS);
     }
 
-    // plays out a random game from startView, returns 1.0 if we win else 0.0
+    /**
+     * runs a random game from startView using RandomAgent proxies via the game loop.
+     * returns 1.0 if myLogicalPlayerIdx wins, 0.0 otherwise.
+     */
     private float rollout(final GameView startView,
                           final int myLogicalPlayerIdx,
-                          final DummyAgent[] agents)
+                          final RandomAgent[] randoms)
     {
-        Game stateCopy = new Game(startView);
-        int steps      = 0;
+        Game sim = new Game(startView, randoms);
 
-        try
+        while (!sim.isOver())
         {
-        while (!stateCopy.isOver() && steps < MAX_ROLLOUT_STEPS)
-        {
-            int currentLogical   = stateCopy.getPlayerOrder().getCurrentLogicalPlayerIdx();
-            DummyAgent agent     = agents[currentLogical];
-            GameView simView     = stateCopy.getOmniscientView();
-            Hand currentHand     = stateCopy.getHand(currentLogical);
-
-            // build handview to check legal moves
-            List<Card> cardList = new ArrayList<>();
-            for (int i = 0; i < currentHand.size(); i++)
-            {
-                cardList.add(currentHand.getCard(i));
-            }
-            HandView hv        = new HandView(cardList);
-            Set<Integer> legal = hv.getLegalMoves(simView);
-
-            Move move;
-
-            if (!stateCopy.getUnresolvedCards().isEmpty() && legal.isEmpty())
-            {
-                // forced to draw the stack
-                move = null;
-            }
-            else if (legal.isEmpty())
-            {
-                // draw one card
-                int drawnIdx = stateCopy.drawCard(currentHand);
-                Card drawn   = currentHand.getCard(drawnIdx);
-
-                // recheck legality
-                List<Card> newList = new ArrayList<>();
-                for (int i = 0; i < currentHand.size(); i++)
-                {
-                    newList.add(currentHand.getCard(i));
-                }
-                HandView hv2           = new HandView(newList);
-                Set<Integer> afterDraw = hv2.getLegalMoves(stateCopy.getOmniscientView());
-
-                if (afterDraw.contains(drawnIdx))
-                {
-                    // must play it
-                    if (drawn.isWild())
-                    {
-                        move = Move.createMove(agent, drawnIdx,
-                                               Color.getRandomColor(this.getRandom()));
-                    }
-                    else
-                    {
-                        move = Move.createMove(agent, drawnIdx);
-                    }
-                }
-                else
-                {
-                    move = null;
-                }
-            }
-            else
-            {
-                // pick a random legal card
-                List<Integer> legalList = new ArrayList<>(legal);
-                int cardIdx = legalList.get(this.getRandom().nextInt(legalList.size()));
-                Card card   = currentHand.getCard(cardIdx);
-
-                if (card.isWild())
-                {
-                    move = Move.createMove(agent, cardIdx,
-                                           Color.getRandomColor(this.getRandom()));
-                }
-                else
-                {
-                    move = Move.createMove(agent, cardIdx);
-                }
-            }
-
-            stateCopy.resolveMove(move);
-            steps++;
-        }
-        }
-        catch (NullPointerException e)
-        {
-            // game copy has null rng, can't shuffle discard into draw pile
-            // treat as inconclusive — return 0.5 as neutral estimate
-            return 0.5f;
+            Move move = sim.getMove();
+            sim.resolveMove(move);
         }
 
-        // 1 if we won, 0 otherwise
-        int winner = findWinner(stateCopy);
+        int winner = findWinner(sim);
         return (winner == myLogicalPlayerIdx) ? 1.0f : 0.0f;
     }
 
@@ -236,131 +178,6 @@ public class ExpectedOutcomeAgent
         return bestIdx;
     }
 
-    /**
-     * samples one random path through the tree down to MAX_DEPTH,
-     * does one rollout at the leaf, then backprops the result up.
-     * each call = one iteration of expected-outcome mcts.
-     * returns the sampled utility from myLogicalPlayerIdx's perspective.
-     */
-    private float expectedOutcome(final MCTSNode node,
-                                  final int myLogicalPlayerIdx,
-                                  final int depth,
-                                  final DummyAgent[] agents)
-    {
-        GameView view     = node.getGameView();
-        NodeState state   = node.getNodeState();
-        int currentPlayer = view.getPlayerOrder().getCurrentLogicalPlayerIdx();
-        Random rng        = this.getRandom();
-        DummyAgent agent  = agents[currentPlayer];
-
-        // actual terminal — real utility, no rollout needed
-        if (node.isTerminal())
-        {
-            Game termGame = new Game(view);
-            int winner    = findWinner(termGame);
-            return (winner == myLogicalPlayerIdx) ? 1.0f : 0.0f;
-        }
-
-        // hit depth limit — do one rollout and return
-        if (depth == 0)
-        {
-            return rollout(view, myLogicalPlayerIdx, agents);
-        }
-
-        if (state == NodeState.HAS_LEGAL_MOVES)
-        {
-            List<Integer> legalMoves = node.getOrderedLegalMoves();
-            int numMoves = legalMoves.size();
-
-            // pick one random action to follow this iteration
-            int i       = rng.nextInt(numMoves);
-            int cardIdx = legalMoves.get(i);
-            HandView hv = view.getHandView(currentPlayer);
-            Card card   = hv.getCard(cardIdx);
-
-            Move move;
-            if (card.isWild())
-            {
-                move = Move.createMove(agent, cardIdx, Color.getRandomColor(rng));
-            }
-            else
-            {
-                move = Move.createMove(agent, cardIdx);
-            }
-
-            // recurse down the sampled child
-            MCTSNode child = (MCTSNode) node.getChild(move);
-            float sample   = expectedOutcome(child, myLogicalPlayerIdx, depth - 1, agents);
-
-            // update q-value for the chosen action only
-            node.setQValueTotal(i, node.getQValueTotal(i) + sample);
-            node.setQCount(i, node.getQCount(i) + 1);
-
-            return sample;
-        }
-        else if (state == NodeState.NO_LEGAL_MOVES_UNRESOLVED_CARDS_PRESENT)
-        {
-            // only one child — forced to draw the stack
-            MCTSNode child = (MCTSNode) node.getChild(null);
-            float sample   = expectedOutcome(child, myLogicalPlayerIdx, depth - 1, agents);
-
-            int idx = DrawUnresolvedCardsIdxs.MOVE_IDX;
-            node.setQValueTotal(idx, node.getQValueTotal(idx) + sample);
-            node.setQCount(idx, node.getQCount(idx) + 1);
-
-            return sample;
-        }
-        else // NO_LEGAL_MOVES_MAY_PLAY_DRAWN_CARD
-        {
-            // must play the drawn card — only one child to explore
-            HandView hv  = view.getHandView(currentPlayer);
-            int drawnIdx = hv.size() - 1;
-            Card drawn   = hv.getCard(drawnIdx);
-
-            Move playMove;
-            if (drawn.isWild())
-            {
-                playMove = Move.createMove(agent, drawnIdx, Color.getRandomColor(rng));
-            }
-            else
-            {
-                playMove = Move.createMove(agent, drawnIdx);
-            }
-
-            MCTSNode playChild = (MCTSNode) node.getChild(playMove);
-            float sample       = expectedOutcome(playChild, myLogicalPlayerIdx, depth - 1, agents);
-
-            int idx = DrawSingleCardIdxs.PLAY_CARD_MOVE_IDX;
-            node.setQValueTotal(idx, node.getQValueTotal(idx) + sample);
-            node.setQCount(idx, node.getQCount(idx) + 1);
-
-            return sample;
-        }
-    }
-
-    /**
-     * builds root node and runs expected-outcome in a loop until interrupted by timedSearch.
-     */
-    @Override
-    public Node search(final GameView game,
-                       final Integer drawnCardIdx)
-    {
-        int myLogicalIdx      = this.getLogicalPlayerIdx();
-        int currentLogicalIdx = game.getPlayerOrder().getCurrentLogicalPlayerIdx();
-        MCTSNode root         = new MCTSNode(game, currentLogicalIdx, null);
-        DummyAgent[] agents   = buildDummyAgents(game);
-
-        // fixed number of iterations
-        int iters = 0;
-        while (!Thread.currentThread().isInterrupted() && iters < 5000)
-        {
-            expectedOutcome(root, myLogicalIdx, MAX_DEPTH, agents);
-            iters++;
-        }
-
-        return root;
-    }
-
     // picks the color we have the most of — best choice when playing a wild
     private Color bestColor(final HandView hv)
     {
@@ -377,6 +194,179 @@ public class ExpectedOutcomeAgent
             if (counts[j] > counts[best]) best = j;
         return colors[best];
     }
+
+    /**
+     * expected-outcome mcts — expands ALL children at each node like minimax,
+     * does NUM_ROLLOUTS rollouts at each artificial leaf to estimate value.
+     * returns the expected utility from myLogicalPlayerIdx's perspective.
+     */
+    private static final int NUM_ROLLOUTS = 5;
+
+    private float expectedOutcome(final MCTSNode node,
+                                  final int myLogicalPlayerIdx,
+                                  final int depth,
+                                  final DummyAgent[] dummies,
+                                  final RandomAgent[] randoms)
+    {
+        GameView view     = node.getGameView();
+        NodeState state   = node.getNodeState();
+        int currentPlayer = view.getPlayerOrder().getCurrentLogicalPlayerIdx();
+        Random rng        = this.getRandom();
+        DummyAgent agent  = dummies[currentPlayer];
+
+        // terminal — real utility
+        if (node.isTerminal())
+        {
+            Game termGame = new Game(view, dummies);
+            int winner    = findWinner(termGame);
+            return (winner == myLogicalPlayerIdx) ? 1.0f : 0.0f;
+        }
+
+        // treat as leaf if we're running out of time
+        if (depth == 0 || (System.currentTimeMillis() - searchStartTime) > TIME_LIMIT_MS)
+        {
+            float total = 0.0f;
+            for (int r = 0; r < NUM_ROLLOUTS; r++)
+            {
+                total += rollout(view, myLogicalPlayerIdx, randoms);
+            }
+            return total / NUM_ROLLOUTS;
+        }
+
+        if (state == NodeState.HAS_LEGAL_MOVES)
+        {
+            List<Integer> legalMoves = node.getOrderedLegalMoves();
+            int numMoves = legalMoves.size();
+            float[] childVals = new float[numMoves];
+            HandView hv       = view.getHandView(currentPlayer);
+            Set<Integer> actualLegal = hv.getLegalMoves(view);
+
+            // expand every child
+            for (int i = 0; i < numMoves; i++)
+            {
+                int cardIdx = legalMoves.get(i);
+
+                // skip if not actually legal per the game view
+                if (!actualLegal.contains(cardIdx)) continue;
+
+                Card card = hv.getCard(cardIdx);
+
+                Move move;
+                if (card.isWild())
+                {
+                    move = Move.createMove(agent, cardIdx, Color.getRandomColor(rng));
+                }
+                else
+                {
+                    move = Move.createMove(agent, cardIdx);
+                }
+
+                MCTSNode child = (MCTSNode) node.getChild(move);
+                float val      = expectedOutcome(child, myLogicalPlayerIdx, depth - 1, dummies, randoms);
+                childVals[i]   = val;
+
+                node.setQValueTotal(i, node.getQValueTotal(i) + val);
+                node.setQCount(i, node.getQCount(i) + 1);
+            }
+
+            // minimax: max on our turn, min on opponent's
+            if (currentPlayer == myLogicalPlayerIdx)
+            {
+                float best = Float.NEGATIVE_INFINITY;
+                for (float v : childVals) best = Math.max(best, v);
+                return best;
+            }
+            else
+            {
+                float worst = Float.POSITIVE_INFINITY;
+                for (float v : childVals) worst = Math.min(worst, v);
+                return worst;
+            }
+        }
+        else if (state == NodeState.NO_LEGAL_MOVES_UNRESOLVED_CARDS_PRESENT)
+        {
+            // only one child
+            MCTSNode child = (MCTSNode) node.getChild(null);
+            float val      = expectedOutcome(child, myLogicalPlayerIdx, depth - 1, dummies, randoms);
+
+            int idx = DrawUnresolvedCardsIdxs.MOVE_IDX;
+            node.setQValueTotal(idx, node.getQValueTotal(idx) + val);
+            node.setQCount(idx, node.getQCount(idx) + 1);
+
+            return val;
+        }
+        else // NO_LEGAL_MOVES_MAY_PLAY_DRAWN_CARD
+        {
+            HandView hv        = view.getHandView(currentPlayer);
+            // the drawn card will be at index hv.size() after getChild draws it
+            int drawnIdx       = hv.size();
+            Set<Integer> legal = hv.getLegalMoves(view);
+
+            // always explore keep child (null move = keep the drawn card)
+            MCTSNode keepChild = (MCTSNode) node.getChild(null);
+            float keepVal      = expectedOutcome(keepChild, myLogicalPlayerIdx, depth - 1, dummies, randoms);
+
+            node.setQValueTotal(DrawSingleCardIdxs.KEEP_CARD_MOVE_IDX,
+                node.getQValueTotal(DrawSingleCardIdxs.KEEP_CARD_MOVE_IDX) + keepVal);
+            node.setQCount(DrawSingleCardIdxs.KEEP_CARD_MOVE_IDX,
+                node.getQCount(DrawSingleCardIdxs.KEEP_CARD_MOVE_IDX) + 1);
+
+            float playVal = keepVal; // default if not playable
+
+            // check the child's hand for the drawn card legality
+            // since drawing happens inside getChild, check using the keep child's view
+            HandView keepHv     = keepChild.getGameView().getHandView(currentPlayer);
+            int actualDrawnIdx  = keepHv.size() - 1; // last card = drawn card
+            Card drawn          = keepHv.getCard(actualDrawnIdx);
+            Set<Integer> keepLegal = keepHv.getLegalMoves(keepChild.getGameView());
+
+            if (keepLegal.contains(actualDrawnIdx))
+            {
+                Move playMove;
+                if (drawn.isWild())
+                {
+                    playMove = Move.createMove(agent, actualDrawnIdx, Color.getRandomColor(rng));
+                }
+                else
+                {
+                    playMove = Move.createMove(agent, actualDrawnIdx);
+                }
+                MCTSNode playChild = (MCTSNode) node.getChild(playMove);
+                playVal            = expectedOutcome(playChild, myLogicalPlayerIdx, depth - 1, dummies, randoms);
+
+                node.setQValueTotal(DrawSingleCardIdxs.PLAY_CARD_MOVE_IDX,
+                    node.getQValueTotal(DrawSingleCardIdxs.PLAY_CARD_MOVE_IDX) + playVal);
+                node.setQCount(DrawSingleCardIdxs.PLAY_CARD_MOVE_IDX,
+                    node.getQCount(DrawSingleCardIdxs.PLAY_CARD_MOVE_IDX) + 1);
+            }
+
+            if (currentPlayer == myLogicalPlayerIdx)
+            {
+                return Math.max(playVal, keepVal);
+            }
+            else
+            {
+                return Math.min(playVal, keepVal);
+            }
+        }
+    }
+
+    @Override
+    public Node search(final GameView game,
+                       final Integer drawnCardIdx)
+    {
+        int myLogicalIdx      = this.getLogicalPlayerIdx();
+        int currentLogicalIdx = game.getPlayerOrder().getCurrentLogicalPlayerIdx();
+        DummyAgent[]  dummies = buildDummyAgents(game);
+        RandomAgent[] randoms = buildRandomAgents(game);
+        MCTSNode root         = new MCTSNode(game, currentLogicalIdx, null, dummies);
+
+        this.searchStartTime = System.currentTimeMillis();
+        expectedOutcome(root, myLogicalIdx, MAX_DEPTH, dummies, randoms);
+
+        return root;
+    }
+
     @Override
     public Move argmaxQValues(final Node node)
     {
@@ -391,26 +381,20 @@ public class ExpectedOutcomeAgent
         {
             List<Integer> legalMoves = node.getOrderedLegalMoves();
             HandView hv  = view.getHandView(currentPlayer);
-            int bestMoveIdx  = -1;
-            float bestQValue = Float.NEGATIVE_INFINITY;
+            int bestIdx  = 0;
+            float bestQV = Float.NEGATIVE_INFINITY;
 
             for (int i = 0; i < legalMoves.size(); i++)
             {
                 float qv = node.getQValue(i);
-                if (qv > bestQValue)
+                if (qv > bestQV)
                 {
-                    bestQValue  = qv;
-                    bestMoveIdx = i;
+                    bestQV  = qv;
+                    bestIdx = i;
                 }
             }
 
-            if (bestMoveIdx < 0)
-            {
-                // nothing was better, just take the first one
-                bestMoveIdx = 0;
-            }
-
-            int cardIdx = legalMoves.get(bestMoveIdx);
+            int cardIdx = legalMoves.get(bestIdx);
             Card card   = hv.getCard(cardIdx);
 
             if (card.isWild())
@@ -424,23 +408,34 @@ public class ExpectedOutcomeAgent
         }
         else if (state == NodeState.NO_LEGAL_MOVES_UNRESOLVED_CARDS_PRESENT)
         {
-            // no choice here, game engine handles drawing
+            // no choice — game engine handles drawing
             return null;
         }
         else // NO_LEGAL_MOVES_MAY_PLAY_DRAWN_CARD
         {
-            // must play the drawn card — no choice
-            HandView hv  = view.getHandView(currentPlayer);
-            int drawnIdx = hv.size() - 1;
-            Card card    = hv.getCard(drawnIdx);
+            // pick whichever of play/keep has the better q-value
+            float playQV = node.getQValue(DrawSingleCardIdxs.PLAY_CARD_MOVE_IDX);
+            float keepQV = node.getQValue(DrawSingleCardIdxs.KEEP_CARD_MOVE_IDX);
 
-            if (card.isWild())
+            if (playQV >= keepQV)
             {
-                return Move.createMove(agent, drawnIdx, bestColor(hv));
+                HandView hv  = view.getHandView(currentPlayer);
+                int drawnIdx = hv.size() - 1;
+                Card card    = hv.getCard(drawnIdx);
+
+                if (card.isWild())
+                {
+                    return Move.createMove(agent, drawnIdx, bestColor(hv));
+                }
+                else
+                {
+                    return Move.createMove(agent, drawnIdx);
+                }
             }
             else
             {
-                return Move.createMove(agent, drawnIdx);
+                // keep the drawn card — return null per api contract
+                return null;
             }
         }
     }
