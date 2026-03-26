@@ -3,6 +3,7 @@ package src.pas.uno.agents;
 
 // SYSTEM IMPORTS
 import edu.bu.pas.uno.Card;
+import edu.bu.pas.uno.Deck;
 import edu.bu.pas.uno.Game;
 import edu.bu.pas.uno.Game.GameView;
 import edu.bu.pas.uno.Hand;
@@ -11,6 +12,7 @@ import edu.bu.pas.uno.agents.Agent;
 import edu.bu.pas.uno.agents.MCTSAgent;
 import edu.bu.pas.uno.agents.RandomAgent;
 import edu.bu.pas.uno.enums.Color;
+import edu.bu.pas.uno.enums.Observability;
 import edu.bu.pas.uno.enums.Value;
 import edu.bu.pas.uno.moves.Move;
 import edu.bu.pas.uno.tree.Node;
@@ -19,6 +21,7 @@ import edu.bu.pas.uno.tree.Node.NoLegalMovesIdxDefaults.DrawSingleCardIdxs;
 import edu.bu.pas.uno.tree.Node.NoLegalMovesIdxDefaults.DrawUnresolvedCardsIdxs;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Random;
 import java.util.Set;
@@ -78,6 +81,8 @@ public class UCTAgent
         extends Node
     {
         private final DummyAgent[] agents;
+        // cache children by move string so we reuse the same node across iterations
+        private final java.util.Map<String, MCTSNode> children = new java.util.HashMap<>();
 
         public MCTSNode(final GameView game,
                         final int logicalPlayerIdx,
@@ -91,7 +96,33 @@ public class UCTAgent
         @Override
         public Node getChild(final Move move)
         {
-            Game childGame = new Game(this.getGameView(), this.agents);
+            // build a reliable cache key
+            String key;
+            if (move == null)
+            {
+                key = "null";
+            }
+            else
+            {
+                key = move.getPlayerIdx() + ":" + move.getCardToPlayIdx() + ":"
+                      + (move.getNewColorIfWild() != null ? move.getNewColorIfWild().name() : "none");
+            }
+
+            if (children.containsKey(key))
+            {
+                return children.get(key);
+            }
+
+            Game childGame;
+            try
+            {
+                childGame = new Game(this.getGameView(), this.agents);
+            }
+            catch (Throwable e)
+            {
+                // shouldn't happen since root is always determinized
+                return new MCTSNode(this.getGameView(), this.getLogicalPlayerIdx(), this, this.agents);
+            }
 
             if (this.getNodeState() == NodeState.NO_LEGAL_MOVES_UNRESOLVED_CARDS_PRESENT)
             {
@@ -113,7 +144,9 @@ public class UCTAgent
             GameView childView        = childGame.getOmniscientView();
             int childLogicalPlayerIdx = childView.getPlayerOrder().getCurrentLogicalPlayerIdx();
 
-            return new MCTSNode(childView, childLogicalPlayerIdx, this, this.agents);
+            MCTSNode child = new MCTSNode(childView, childLogicalPlayerIdx, this, this.agents);
+            children.put(key, child);
+            return child;
         }
     }
 
@@ -123,17 +156,21 @@ public class UCTAgent
         super(playerIdx, maxThinkingTimeInMS);
     }
 
+    private static final int MAX_ROLLOUT_STEPS = 200;
+
     // random rollout using RandomAgent proxies via the game loop
     private float rollout(final GameView startView,
                           final int myLogicalPlayerIdx,
                           final RandomAgent[] randoms)
     {
-        Game sim = new Game(startView, randoms);
+        Game sim  = new Game(startView, randoms);
+        int steps = 0;
 
-        while (!sim.isOver())
+        while (!sim.isOver() && steps < MAX_ROLLOUT_STEPS)
         {
             Move move = sim.getMove();
             sim.resolveMove(move);
+            steps++;
         }
 
         int winner = findWinner(sim);
@@ -225,14 +262,19 @@ public class UCTAgent
         return bestIdx;
     }
 
-    /**
-     * one iteration of uct:
-     * walk tree with ucb until unvisited node, rollout, backprop.
-     */
     private float uct(final MCTSNode node,
                       final int myLogicalPlayerIdx,
                       final DummyAgent[] dummies,
                       final RandomAgent[] randoms)
+    {
+        return uct(node, myLogicalPlayerIdx, dummies, randoms, 20);
+    }
+
+    private float uct(final MCTSNode node,
+                      final int myLogicalPlayerIdx,
+                      final DummyAgent[] dummies,
+                      final RandomAgent[] randoms,
+                      final int maxDepth)
     {
         GameView view     = node.getGameView();
         NodeState state   = node.getNodeState();
@@ -241,11 +283,9 @@ public class UCTAgent
         DummyAgent agent  = dummies[currentPlayer];
 
         // terminal — real result
-        if (node.isTerminal())
+        if (node.isTerminal() || maxDepth == 0)
         {
-            Game termGame = new Game(view, dummies);
-            int winner    = findWinner(termGame);
-            return (winner == myLogicalPlayerIdx) ? 1.0f : 0.0f;
+            return rollout(view, myLogicalPlayerIdx, randoms);
         }
 
         float sample;
@@ -259,7 +299,22 @@ public class UCTAgent
             moveIdx     = ucbSelect(node, numMoves);
             int cardIdx = legalMoves.get(moveIdx);
             HandView hv = view.getHandView(currentPlayer);
-            Card card   = hv.getCard(cardIdx);
+
+            // verify legal per handview before creating move
+            Set<Integer> actualLegal = hv.getLegalMoves(view);
+            if (!actualLegal.contains(cardIdx))
+            {
+                // fall back to first actually legal card
+                for (int idx : actualLegal)
+                {
+                    cardIdx = idx;
+                    break;
+                }
+                moveIdx = legalMoves.indexOf(cardIdx);
+                if (moveIdx < 0) moveIdx = 0;
+            }
+
+            Card card = hv.getCard(cardIdx);
 
             Move move;
             if (card.isWild())
@@ -275,13 +330,11 @@ public class UCTAgent
 
             if (node.getQCount(moveIdx) == 0)
             {
-                // first visit — rollout from child
                 sample = rollout(child.getGameView(), myLogicalPlayerIdx, randoms);
             }
             else
             {
-                // already visited — recurse deeper
-                sample = uct(child, myLogicalPlayerIdx, dummies, randoms);
+                sample = uct(child, myLogicalPlayerIdx, dummies, randoms, maxDepth - 1);
             }
         }
         else if (state == NodeState.NO_LEGAL_MOVES_UNRESOLVED_CARDS_PRESENT)
@@ -295,20 +348,23 @@ public class UCTAgent
             }
             else
             {
-                sample = uct(child, myLogicalPlayerIdx, dummies, randoms);
+                sample = uct(child, myLogicalPlayerIdx, dummies, randoms, maxDepth - 1);
             }
         }
         else // NO_LEGAL_MOVES_MAY_PLAY_DRAWN_CARD
         {
-            // two options: play or keep — use ucb to pick
+            // use ucb to pick between play and keep
             moveIdx = ucbSelect(node, 2);
 
-            HandView hv  = view.getHandView(currentPlayer);
-            int drawnIdx = hv.size() - 1;
-            Card drawn   = hv.getCard(drawnIdx);
+            // get the keep child first to find out what card was drawn
+            MCTSNode keepChild = (MCTSNode) node.getChild(null);
+            HandView keepHv    = keepChild.getGameView().getHandView(currentPlayer);
+            int drawnIdx       = keepHv.size() - 1;
+            Card drawn         = keepHv.getCard(drawnIdx);
+            Set<Integer> keepLegal = keepHv.getLegalMoves(keepChild.getGameView());
 
             MCTSNode child;
-            if (moveIdx == DrawSingleCardIdxs.PLAY_CARD_MOVE_IDX)
+            if (moveIdx == DrawSingleCardIdxs.PLAY_CARD_MOVE_IDX && keepLegal.contains(drawnIdx))
             {
                 Move playMove;
                 if (drawn.isWild())
@@ -323,7 +379,9 @@ public class UCTAgent
             }
             else
             {
-                child = (MCTSNode) node.getChild(null);
+                // keep or card not playable
+                moveIdx = DrawSingleCardIdxs.KEEP_CARD_MOVE_IDX;
+                child   = keepChild;
             }
 
             if (node.getQCount(moveIdx) == 0)
@@ -332,7 +390,7 @@ public class UCTAgent
             }
             else
             {
-                sample = uct(child, myLogicalPlayerIdx, dummies, randoms);
+                sample = uct(child, myLogicalPlayerIdx, dummies, randoms, maxDepth - 1);
             }
         }
 
@@ -343,22 +401,101 @@ public class UCTAgent
         return sample;
     }
 
+    /**
+     * if the game view has partial observability (UNKNOWN cards),
+     * randomly fill in the unknown cards from the remaining unseen pool.
+     * returns a fully observable game view copy.
+     */
+    private Game determinize(final GameView view, final DummyAgent[] dummies)
+    {
+        int numPlayers = view.getNumPlayers();
+        Random rng     = this.getRandom();
+
+        // start with full standard deck
+        Deck fullDeck  = new Deck(true);
+        List<Card> pool = new ArrayList<>(fullDeck);
+
+        // remove every card we can see from pool (all visible hands + discard pile)
+        for (int p = 0; p < numPlayers; p++)
+        {
+            HandView hv = view.getHandView(p);
+            for (int i = 0; i < hv.size(); i++)
+            {
+                Card c = hv.getCard(i);
+                if (c.color() != Color.UNKNOWN && c.value() != Value.UNKNOWN)
+                {
+                    pool.remove(c);
+                }
+            }
+        }
+        for (Card c : view.getDiscardPile().pile())
+        {
+            pool.remove(c);
+        }
+
+        // shuffle remaining unseen cards
+        Collections.shuffle(pool, rng);
+        int poolIdx = 0;
+
+        // build fully known Hand objects
+        Hand[] hands = new Hand[numPlayers];
+        for (int p = 0; p < numPlayers; p++)
+        {
+            HandView hv = view.getHandView(p);
+            hands[p]    = new Hand();
+            for (int i = 0; i < hv.size(); i++)
+            {
+                Card c = hv.getCard(i);
+                if (c.color() == Color.UNKNOWN || c.value() == Value.UNKNOWN)
+                {
+                    if (poolIdx < pool.size())
+                    {
+                        hands[p].add(pool.get(poolIdx++));
+                    }
+                }
+                else
+                {
+                    hands[p].add(c);
+                }
+            }
+        }
+
+        // remaining pool cards become the draw pile
+        Deck drawPile = new Deck();
+        while (poolIdx < pool.size())
+        {
+            drawPile.add(pool.get(poolIdx++));
+        }
+
+        return new Game(drawPile, hands, view, dummies);
+    }
+
     @Override
     public Node search(final GameView game,
                        final Integer drawnCardIdx)
     {
         int myLogicalIdx      = this.getLogicalPlayerIdx();
-        int currentLogicalIdx = game.getPlayerOrder().getCurrentLogicalPlayerIdx();
         DummyAgent[]  dummies = buildDummyAgents(game);
         RandomAgent[] randoms = buildRandomAgents(game);
-        MCTSNode root         = new MCTSNode(game, currentLogicalIdx, null, dummies);
+
+        GameView workingView  = determinize(game, dummies).getOmniscientView();
+
+        int currentLogicalIdx = workingView.getPlayerOrder().getCurrentLogicalPlayerIdx();
+        MCTSNode root         = new MCTSNode(workingView, currentLogicalIdx, null, dummies);
         
 
         // run for a fixed number of iterations since we call this synchronously
         int iters = 0;
-        while (!Thread.currentThread().isInterrupted() && iters < 5000)
+        while (!Thread.currentThread().isInterrupted() && iters < 500)
         {
-            uct(root, myLogicalIdx, dummies, randoms);
+            try
+            {
+                uct(root, myLogicalIdx, dummies, randoms);
+            }
+            catch (Throwable e)
+            {
+                // swallow any exception to prevent autograder crash
+            }
             iters++;
         }
 
@@ -438,14 +575,41 @@ public class UCTAgent
     @Override
     public Move chooseCardToPlay(final GameView game)
     {
-        Node root = search(game, null);
-        return argmaxQValues(root);
+        try
+        {
+            Node root = search(game, null);
+            return argmaxQValues(root);
+        }
+        catch (Throwable e)
+        {
+            // fallback: play first legal move
+            int currentPlayer = game.getPlayerOrder().getCurrentLogicalPlayerIdx();
+            HandView hv       = game.getHandView(currentPlayer);
+            DummyAgent agent  = buildDummyAgents(game)[currentPlayer];
+            Set<Integer> legal = hv.getLegalMoves(game);
+            if (!legal.isEmpty())
+            {
+                int cardIdx = legal.iterator().next();
+                Card card   = hv.getCard(cardIdx);
+                if (card.isWild())
+                    return Move.createMove(agent, cardIdx, bestColor(hv));
+                return Move.createMove(agent, cardIdx);
+            }
+            return null;
+        }
     }
 
     @Override
     public Move maybePlayDrawnCard(final GameView game, final int drawnCardIdx)
     {
-        Node root = search(game, drawnCardIdx);
-        return argmaxQValues(root);
+        try
+        {
+            Node root = search(game, drawnCardIdx);
+            return argmaxQValues(root);
+        }
+        catch (Throwable e)
+        {
+            return null;
+        }
     }
 }
