@@ -460,8 +460,8 @@ public class UnoMCTSAgent
         int currentLogicalIdx = workingView.getPlayerOrder().getCurrentLogicalPlayerIdx();
         MCTSNode root         = new MCTSNode(workingView, currentLogicalIdx, null, dummies, this);
 
-        // run until time is up — use most of the allotted thinking time
-        long deadline = System.currentTimeMillis() + this.getMaxThinkingTimeInMS() - 100;
+        long deadline = System.currentTimeMillis() + 4000;
+
         while (!Thread.currentThread().isInterrupted()
                && System.currentTimeMillis() < deadline)
         {
