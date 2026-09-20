@@ -30,6 +30,6 @@ java -cp "./lib/*:." edu.bu.pas.uno.SingleGameMain src.pas.uno.agents.UCTAgent s
 ---
 
 ## File Structure
-* `src/pas/uno/agents/ExpectedOutcomeAgent.java`: Expected-Outcome MCTS implementation.
-* `src/pas/uno/agents/UCTAgent.java`: Upper Confidence Bound Tree MCTS implementation.
-* `src/pas/uno/agents/UnoMCTSAgent.java`: Partially Observable MCTS implementation for imperfect-information play.
+* `uno/agents/ExpectedOutcomeAgent.java`: Expected-Outcome MCTS implementation.
+* `uno/agents/UCTAgent.java`: Upper Confidence Bound Tree MCTS implementation.
+* `uno/agents/UnoMCTSAgent.java`: Partially Observable MCTS implementation for imperfect-information play.
